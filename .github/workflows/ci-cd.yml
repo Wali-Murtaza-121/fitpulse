@@ -1,0 +1,184 @@
+name: FitPulse CI/CD
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/fitpulse
+
+jobs:
+  # ─── 1. Test Backend ────────────────────────────────────────────────────────
+  test-backend:
+    name: Test Backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: fitpulse_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+
+      - name: Run backend health check test
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: fitpulse_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+        run: |
+          cd backend
+          python -c "
+          from db import init_db, get_connection
+          init_db()
+          conn = get_connection()
+          cur = conn.cursor()
+          cur.execute('SELECT COUNT(*) FROM workouts')
+          count = cur.fetchone()[0]
+          print(f'DB test passed: {count} seeded workouts found')
+          conn.close()
+          "
+
+  # ─── 2. Test Frontend ────────────────────────────────────────────────────────
+  test-frontend:
+    name: Test Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend && npm ci
+
+      - name: TypeScript type check
+        run: cd frontend && npx tsc --noEmit
+
+      - name: Build
+        run: cd frontend && npm run build
+        env:
+          VITE_API_URL: http://localhost:8000
+
+  # ─── 3. Build & Push Docker Images ──────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:${{ github.sha }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          build-args: |
+            VITE_API_URL=${{ secrets.VITE_API_URL }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:${{ github.sha }}
+
+  # ─── 4. Deploy to Dev Server ─────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev Server
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/dev'
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/fitpulse
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker system prune -f
+            echo "✅ Deployed to dev server at $(date)"
+
+  # ─── 5. Deploy to Production ─────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/fitpulse
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker system prune -f
+            echo "✅ Deployed to production at $(date)"
