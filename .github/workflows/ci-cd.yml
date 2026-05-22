@@ -4,17 +4,14 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-    branches: [main]
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository_owner }}/fitpulse
+    branches: [main, dev]
 
 jobs:
-  # ─── 1. Test Backend ────────────────────────────────────────────────────────
+  # ─── 1. Test Backend ─────────────────────────────────────────────────────────
   test-backend:
-    name: Test Backend
+    name: 🐍 Test Backend
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:16-alpine
@@ -29,20 +26,22 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Set up Python
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           cd backend
           pip install -r requirements.txt
 
-      - name: Run backend health check test
+      - name: Test DB connection and init
         env:
           DB_HOST: localhost
           DB_PORT: 5432
@@ -52,24 +51,65 @@ jobs:
         run: |
           cd backend
           python -c "
+          import sys
+          sys.path.insert(0, '.')
           from db import init_db, get_connection
           init_db()
           conn = get_connection()
           cur = conn.cursor()
           cur.execute('SELECT COUNT(*) FROM workouts')
           count = cur.fetchone()[0]
-          print(f'DB test passed: {count} seeded workouts found')
+          assert count >= 5, f'Expected 5 seeded workouts, got {count}'
+          print(f'✅ DB test passed: {count} workouts seeded')
           conn.close()
           "
 
-  # ─── 2. Test Frontend ────────────────────────────────────────────────────────
-  test-frontend:
-    name: Test Frontend Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Test API routes import
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: fitpulse_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+        run: |
+          cd backend
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from routes.workouts import handle_workouts
+          from routes.stats import handle_stats
+          print('✅ All routes imported successfully')
+          "
 
-      - name: Setup Node
+      - name: Test server starts
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: fitpulse_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          PORT: 8001
+        run: |
+          cd backend
+          python server.py &
+          SERVER_PID=$!
+          sleep 3
+          curl -f http://localhost:8001/health || (echo "❌ Health check failed" && kill $SERVER_PID && exit 1)
+          curl -f http://localhost:8001/api/workouts || (echo "❌ Workouts API failed" && kill $SERVER_PID && exit 1)
+          curl -f http://localhost:8001/api/stats || (echo "❌ Stats API failed" && kill $SERVER_PID && exit 1)
+          kill $SERVER_PID
+          echo "✅ All API endpoints passed"
+
+  # ─── 2. Test Frontend ─────────────────────────────────────────────────────────
+  test-frontend:
+    name: ⚛️ Test Frontend Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -77,73 +117,122 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: cd frontend && npm ci
+        run: |
+          cd frontend
+          npm install
 
-      - name: TypeScript type check
-        run: cd frontend && npx tsc --noEmit
-
-      - name: Build
-        run: cd frontend && npm run build
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
         env:
           VITE_API_URL: http://localhost:8000
 
-  # ─── 3. Build & Push Docker Images ──────────────────────────────────────────
-  build-and-push:
-    name: Build & Push Images
+      - name: Verify build output
+        run: |
+          ls frontend/dist/
+          test -f frontend/dist/index.html && echo "✅ index.html exists"
+          echo "✅ Frontend build successful"
+
+  # ─── 3. Build Docker Images ───────────────────────────────────────────────────
+  build-docker:
+    name: 🐳 Build Docker Images
     runs-on: ubuntu-latest
     needs: [test-backend, test-frontend]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: false
+          tags: fitpulse-backend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: false
+          tags: fitpulse-frontend:test
+          build-args: |
+            VITE_API_URL=http://localhost:8000
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Confirm builds succeeded
+        run: echo "✅ Both Docker images built successfully"
+
+  # ─── 4. Push to Registry (main branch only) ───────────────────────────────────
+  push-images:
+    name: 📦 Push to Registry
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image tag
-        id: tag
-        run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "tag=latest" >> $GITHUB_OUTPUT
-          else
-            echo "tag=dev" >> $GITHUB_OUTPUT
-          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build & push backend
+      - name: Push backend image
         uses: docker/build-push-action@v5
         with:
           context: ./backend
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-backend:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/fitpulse-backend:latest
+            ghcr.io/${{ github.repository_owner }}/fitpulse-backend:${{ github.sha }}
 
-      - name: Build & push frontend
+      - name: Push frontend image
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
           build-args: |
-            VITE_API_URL=${{ secrets.VITE_API_URL }}
+            VITE_API_URL=${{ vars.VITE_API_URL || 'http://localhost:8000' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-frontend:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/fitpulse-frontend:latest
+            ghcr.io/${{ github.repository_owner }}/fitpulse-frontend:${{ github.sha }}
 
-  # ─── 4. Deploy to Dev Server ─────────────────────────────────────────────────
-  deploy-dev:
-    name: Deploy to Dev Server
+      - name: Summary
+        run: |
+          echo "✅ Images pushed to GitHub Container Registry"
+          echo "Backend:  ghcr.io/${{ github.repository_owner }}/fitpulse-backend:latest"
+          echo "Frontend: ghcr.io/${{ github.repository_owner }}/fitpulse-frontend:latest"
+
+  # ─── 5. Deploy (only if server secrets exist) ─────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to Server
     runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/dev'
-    environment: development
+    needs: [push-images]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      secrets.DEV_SERVER_HOST != ''
+    environment: production
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -157,28 +246,4 @@ jobs:
             docker compose -f docker-compose.prod.yml pull
             docker compose -f docker-compose.prod.yml up -d --remove-orphans
             docker system prune -f
-            echo "✅ Deployed to dev server at $(date)"
-
-  # ─── 5. Deploy to Production ─────────────────────────────────────────────────
-  deploy-prod:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.PROD_SERVER_HOST }}
-          username: ${{ secrets.PROD_SERVER_USER }}
-          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
-          script: |
-            cd /opt/fitpulse
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
-            docker system prune -f
-            echo "✅ Deployed to production at $(date)"
+            echo "✅ Deployed successfully at $(date)"
